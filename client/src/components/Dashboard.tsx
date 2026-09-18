@@ -1,8 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Board } from '../types';
 import { boardApi, templateApi } from '../services/api';
 import { useWhiteboardStore } from '../store/whiteboard';
 import { TemplateCenter } from './TemplateCenter';
+import {
+  CreateBoardDraft,
+  loadCreateDraft,
+  saveCreateDraft,
+  clearCreateDraft,
+} from '../services/draft';
 
 interface DashboardProps {
   onBoardSelect: (board: Board) => void;
@@ -132,46 +138,92 @@ const BoardCard: React.FC<{
 export const Dashboard: React.FC<DashboardProps> = ({ onBoardSelect }) => {
   const [boards, setBoards] = useState<Board[]>([]);
   const [loading, setLoading] = useState(true);
+  // 列表请求失败与「确实没有记录」分开表示，避免渲染成同一种结果
+  const [listError, setListError] = useState<string | null>(null);
   const [isTemplateCenterOpen, setIsTemplateCenterOpen] = useState(false);
+  // 上次未完成的新建请求，刷新后仍可继续提交
+  const [pendingDraft, setPendingDraft] = useState<CreateBoardDraft | null>(null);
+  const [retrying, setRetrying] = useState(false);
   const username = useWhiteboardStore((state) => state.username);
 
   const userId = 'user-1';
 
   useEffect(() => {
     loadBoards();
+    setPendingDraft(loadCreateDraft(userId));
   }, []);
 
   const loadBoards = async () => {
     try {
       setLoading(true);
+      setListError(null);
       const data = await boardApi.getBoards(userId);
       setBoards(data);
     } catch (error) {
       console.error('Failed to load boards:', error);
+      const message = error instanceof Error && error.message
+        ? error.message
+        : '白板列表加载失败，请重试';
+      setListError(message);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleCreateBoard = async (name: string, templateId?: string) => {
+  // 仅在请求成功时返回新白板；失败时抛出，由弹窗保留内容并标记错误
+  const createBoardRequest = async (name: string, templateId?: string): Promise<Board> => {
+    if (templateId) {
+      const board = await templateApi.createBoardFromTemplate(templateId, { name, ownerId: userId });
+      if (!board) throw new Error('创建白板失败，请重试');
+      return board;
+    }
+    const board = await boardApi.createBoard({ name, ownerId: userId });
+    if (!board) throw new Error('创建白板失败，请重试');
+    return board;
+  };
+
+  const handleCreateBoard = async (name: string, templateId?: string): Promise<Board> => {
+    const newBoard = await createBoardRequest(name, templateId);
+    clearCreateDraft(userId);
+    setPendingDraft(null);
+    // 成功后刷新列表，确保新白板按更新时间/归属进入正确分类；
+    // 即使刷新失败也先进入白板，返回工作台时会重新拉取
+    await loadBoards().catch(() => undefined);
+    onBoardSelect(newBoard);
+    return newBoard;
+  };
+
+  const handleRetryDraft = async () => {
+    if (!pendingDraft || retrying) return;
+    setRetrying(true);
     try {
-      let newBoard: Board | null = null;
-      if (templateId) {
-        newBoard = await templateApi.createBoardFromTemplate(templateId, { name, ownerId: userId });
-      } else {
-        newBoard = await boardApi.createBoard({ name, ownerId: userId });
-      }
-      if (newBoard) {
-        await loadBoards();
-        onBoardSelect(newBoard);
-      } else {
-        throw new Error('Failed to create board');
-      }
+      const newBoard = await createBoardRequest(pendingDraft.name, pendingDraft.templateId);
+      clearCreateDraft(userId);
+      setPendingDraft(null);
+      await loadBoards().catch(() => undefined);
+      onBoardSelect(newBoard);
     } catch (error) {
-      console.error('Failed to create board:', error);
-      alert('创建白板失败，请重试');
+      const message = error instanceof Error && error.message
+        ? error.message
+        : '创建白板失败，请重试';
+      const updated: CreateBoardDraft = { ...pendingDraft, error: message, savedAt: new Date().toISOString() };
+      saveCreateDraft(userId, updated);
+      setPendingDraft(updated);
+    } finally {
+      setRetrying(false);
     }
   };
+
+  const handleDiscardDraft = () => {
+    clearCreateDraft(userId);
+    setPendingDraft(null);
+  };
+
+  // 从弹窗返回时同步草稿（弹窗内失败会更新错误信息）
+  const handleTemplateCenterClose = useCallback(() => {
+    setIsTemplateCenterOpen(false);
+    setPendingDraft(loadCreateDraft(userId));
+  }, []);
 
   const myBoards = boards.filter((b) => b.ownerId === userId);
   const sharedBoards = boards.filter((b) => b.ownerId !== userId);
@@ -214,8 +266,55 @@ export const Dashboard: React.FC<DashboardProps> = ({ onBoardSelect }) => {
     </div>
   );
 
-  const BoardGrid: React.FC<{ boards: Board[]; loading?: boolean }> = ({ boards: boardList, loading }) => {
-    if (loading) {
+  const ErrorBlock: React.FC<{ message: string; onRetry: () => void }> = ({ message, onRetry }) => (
+    <div
+      style={{
+        textAlign: 'center',
+        padding: '48px 16px',
+        background: '#fef2f2',
+        border: '1px dashed #fecaca',
+        borderRadius: '12px',
+      }}
+    >
+      <svg
+        width="48"
+        height="48"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="#dc2626"
+        strokeWidth="1.5"
+        style={{ margin: '0 auto 16px', opacity: 0.7 }}
+      >
+        <circle cx="12" cy="12" r="10" />
+        <line x1="12" y1="8" x2="12" y2="12" />
+        <line x1="12" y1="16" x2="12.01" y2="16" />
+      </svg>
+      <p style={{ margin: 0, fontSize: '14px', fontWeight: 600, color: '#b91c1c' }}>
+        加载失败
+      </p>
+      <p style={{ margin: '8px 0 16px', fontSize: '13px', color: '#dc2626' }}>{message}</p>
+      <button
+        onClick={onRetry}
+        style={{
+          padding: '8px 18px',
+          fontSize: '13px',
+          fontWeight: 500,
+          color: '#fff',
+          background: '#dc2626',
+          border: 'none',
+          borderRadius: '8px',
+          cursor: 'pointer',
+        }}
+      >
+        重新加载
+      </button>
+    </div>
+  );
+
+  const BoardGrid: React.FC<{ boardList: Board[] }> = ({ boardList }) => {
+    const showSkeleton = loading && boards.length === 0 && !listError;
+
+    if (showSkeleton) {
       return (
         <div
           style={{
@@ -237,6 +336,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ onBoardSelect }) => {
           ))}
         </div>
       );
+    }
+
+    // 请求失败且没有已缓存数据：显示错误态，而不是「暂无白板」
+    if (listError && boardList.length === 0) {
+      return <ErrorBlock message={listError} onRetry={loadBoards} />;
     }
 
     if (boardList.length === 0) {
@@ -454,26 +558,114 @@ export const Dashboard: React.FC<DashboardProps> = ({ onBoardSelect }) => {
           </div>
         </div>
 
+        {/* 未完成的新建请求：持久标出错误并可重新提交，区别于空列表 */}
+        {pendingDraft && (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '16px',
+              background: '#fff',
+              border: '1px solid #fecaca',
+              borderLeft: '4px solid #dc2626',
+              borderRadius: '12px',
+              padding: '16px 20px',
+              marginBottom: '32px',
+              boxShadow: '0 2px 8px rgba(220, 38, 38, 0.08)',
+              flexWrap: 'wrap',
+            }}
+          >
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="1.8">
+              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+              <line x1="12" y1="9" x2="12" y2="13" />
+              <line x1="12" y1="17" x2="12.01" y2="17" />
+            </svg>
+            <div style={{ flex: 1, minWidth: '220px' }}>
+              <div style={{ fontSize: '14px', fontWeight: 600, color: '#1a1a1a' }}>
+                白板「{pendingDraft.name || pendingDraft.templateName || '未命名白板'}」尚未创建成功
+              </div>
+              <div style={{ fontSize: '13px', color: '#6b7280', marginTop: '4px' }}>
+                布局：{pendingDraft.templateName || '空白白板'} · {pendingDraft.error}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: '10px' }}>
+              <button
+                onClick={handleRetryDraft}
+                disabled={retrying}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  padding: '8px 18px',
+                  fontSize: '13px',
+                  fontWeight: 500,
+                  color: '#fff',
+                  background: '#667eea',
+                  border: 'none',
+                  borderRadius: '8px',
+                  cursor: retrying ? 'not-allowed' : 'pointer',
+                  opacity: retrying ? 0.7 : 1,
+                }}
+              >
+                {retrying ? '提交中...' : '重新提交'}
+              </button>
+              <button
+                onClick={() => setIsTemplateCenterOpen(true)}
+                disabled={retrying}
+                style={{
+                  padding: '8px 18px',
+                  fontSize: '13px',
+                  fontWeight: 500,
+                  color: '#374151',
+                  background: '#f3f4f6',
+                  border: 'none',
+                  borderRadius: '8px',
+                  cursor: 'pointer',
+                }}
+              >
+                继续编辑
+              </button>
+              <button
+                onClick={handleDiscardDraft}
+                disabled={retrying}
+                style={{
+                  padding: '8px 14px',
+                  fontSize: '13px',
+                  fontWeight: 500,
+                  color: '#6b7280',
+                  background: 'transparent',
+                  border: '1px solid #e5e7eb',
+                  borderRadius: '8px',
+                  cursor: 'pointer',
+                }}
+              >
+                放弃
+              </button>
+            </div>
+          </div>
+        )}
+
         <section style={{ marginBottom: '40px' }}>
-          <SectionHeader title="最近编辑" count={loading ? undefined : recentBoards.length} />
-          <BoardGrid boards={recentBoards.slice(0, 8)} loading={loading && boards.length === 0} />
+          <SectionHeader title="最近编辑" count={loading || listError ? undefined : recentBoards.length} />
+          <BoardGrid boardList={recentBoards.slice(0, 8)} />
         </section>
 
         <section style={{ marginBottom: '40px' }}>
-          <SectionHeader title="我创建的" count={loading ? undefined : myBoards.length} />
-          <BoardGrid boards={myBoards} loading={loading && boards.length === 0} />
+          <SectionHeader title="我创建的" count={loading || listError ? undefined : myBoards.length} />
+          <BoardGrid boardList={myBoards} />
         </section>
 
         <section>
-          <SectionHeader title="我参与的" count={loading ? undefined : sharedBoards.length} />
-          <BoardGrid boards={sharedBoards} loading={loading && boards.length === 0} />
+          <SectionHeader title="我参与的" count={loading || listError ? undefined : sharedBoards.length} />
+          <BoardGrid boardList={sharedBoards} />
         </section>
       </main>
 
       <TemplateCenter
         isOpen={isTemplateCenterOpen}
-        onClose={() => setIsTemplateCenterOpen(false)}
+        onClose={handleTemplateCenterClose}
         onCreate={handleCreateBoard}
+        userId={userId}
       />
     </div>
   );
